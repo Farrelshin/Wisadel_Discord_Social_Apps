@@ -1,13 +1,17 @@
 import json
 import discord
+import aiohttp # [BARU] Import aiohttp untuk HTTP request
 from discord.ext import commands
 from discord import app_commands
+
+# [BARU] Masukkan URL Webhook Production n8n kamu di sini
+N8N_WEBHOOK_URL = "https://ptilopsis.app.n8n.cloud/webhook/11a19b0a-b7a7-4b59-80db-070377cdc1ba"
 
 # 1. Mengatur intents (hak akses) default untuk bot
 intents = discord.Intents.default()
 intents.message_content = True
 
-# 2. Inisialisasi bot: prefix "w", tanpa help bawaan (kita buat whelp sendiri)
+# 2. Inisialisasi bot
 client = commands.Bot(
     command_prefix="w",
     intents=intents,
@@ -15,19 +19,14 @@ client = commands.Bot(
     help_command=None,
 )
 
-# Masukkan ID unik Server (Guild ID)
-MY_GUILD = discord.Object(id=SERVER_ID)
+MY_GUILD = discord.Object(id=1202785633895194716)
 
 @client.event
 async def on_ready():
     print(f'Logged on as {client.user}!')
-
     try:
-        # Hapus command khusus server lama supaya tidak muncul dobel
         client.tree.clear_commands(guild=MY_GUILD)
         await client.tree.sync(guild=MY_GUILD)
-
-        # Sync sebagai command global (semua server)
         synced = await client.tree.sync()
         print(f'Synced {len(synced)} global command(s).')
     except Exception as e:
@@ -37,46 +36,36 @@ async def on_ready():
 # --- PENYIMPANAN PER-SERVER (MULTI-GUILD) ---
 # ==========================================
 ALLOWED_FILE = "allowed_channels.json"
+DISCOHOOK_FILE = "backups-2026-10-22.json"
 
 def load_allowed():
     try:
         with open(ALLOWED_FILE, "r") as f:
             data = json.load(f)
-            # Jika file JSON lama berbentuk list (bukan dict), reset ke format kosong agar tidak error
             if isinstance(data, list):
                 return {}
-            # Konversi key string dari JSON ke integer (guild_id dan channel_id)
             return {int(g_id): set(c_ids) for g_id, c_ids in data.items()}
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 def save_allowed():
-    # Ubah set ke list agar bisa disimpan ke JSON
     data_to_save = {str(g_id): list(c_ids) for g_id, c_ids in ALLOWED_CHANNELS_PER_GUILD.items()}
     with open(ALLOWED_FILE, "w") as f:
         json.dump(data_to_save, f, indent=4)
 
 ALLOWED_CHANNELS_PER_GUILD = load_allowed()
 
-
-# ==========================================
-# --- CEK RESTRICT CHANNEL PER SERVER ---
-# ==========================================
 def is_channel_allowed(guild, channel):
-    """Fungsi helper untuk mengecek apakah channel diizinkan di server tersebut."""
     if not guild:
-        return True # Jika di luar server (misal DM), loloskan
+        return True
     
     allowed_set = ALLOWED_CHANNELS_PER_GUILD.get(guild.id, set())
-    
-    # Jika server ini belum pernah di-restrict, aktif di semua channel
     if not allowed_set:
         return True
         
     if channel.id in allowed_set:
         return True
         
-    # Thread ikut diizinkan jika channel induknya diizinkan
     parent_id = getattr(channel, "parent_id", None)
     return parent_id in allowed_set
 
@@ -86,70 +75,177 @@ async def cek_restrict(ctx):
 
 @client.event
 async def on_command_error(ctx, error):
-    # Abaikan diam-diam: command tidak ada atau channel direstrict
     if isinstance(error, (commands.CommandNotFound, commands.CheckFailure)):
         return
     print(f'Error command: {error}')
 
 
 # ==========================================
+# --- SISTEM INTEGRASI DISCOHOOK JSON ---
+# ==========================================
+def get_discohook_backup(backup_name):
+    """Membaca file JSON Discohook dan mengambil Embeds & Components berdasarkan nama backup."""
+    try:
+        with open(DISCOHOOK_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            for backup in data.get("backups", []):
+                if backup.get("name") == backup_name:
+                    msg_data = backup["messages"][0]["data"]
+                    
+                    # 1. Konversi raw JSON Embed menjadi discord.Embed
+                    embeds = [discord.Embed.from_dict(e) for e in msg_data.get("embeds", [])]
+                    
+                    # 2. Ambil data komponen (untuk tombol)
+                    components = msg_data.get("components", [])
+                    return embeds, components
+    except Exception as e:
+        print(f"Error membaca {DISCOHOOK_FILE}: {e}")
+    return None, None
+
+class DiscohookView(discord.ui.View):
+    """Mengubah format komponen JSON Discohook menjadi View & Tombol interaktif discord.py."""
+    def __init__(self, components_data):
+        super().__init__(timeout=None)
+        
+        # Loop semua baris aksi (ActionRow / type 1)
+        for action_row in components_data:
+            if action_row.get("type") == 1:
+                # Loop semua tombol di dalam baris tersebut
+                for btn in action_row.get("components", []):
+                    # Hanya memproses tombol berupa Link (type 2, style 5)
+                    if btn.get("type") == 2 and btn.get("style") == 5:
+                        emoji_obj = None
+                        if "emoji" in btn:
+                            e_id = int(btn["emoji"]["id"]) if btn["emoji"].get("id") else None
+                            emoji_obj = discord.PartialEmoji(
+                                name=btn["emoji"].get("name"),
+                                id=e_id,
+                                animated=btn["emoji"].get("animated", False)
+                            )
+                        
+                        # Tambahkan tombol ke dalam View
+                        self.add_item(discord.ui.Button(
+                            label=btn.get("label"), 
+                            url=btn.get("url"), 
+                            emoji=emoji_obj
+                        ))
+
+
+class PanduanDropdown(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="Role Utama", description="Informasi mengenai role utama di server ini.", emoji="🛡️"),
+            discord.SelectOption(label="Leveling Role", description="Informasi mengenai grinding level role.", emoji="📈"),
+            discord.SelectOption(label="UMA Familia", description="Informasi mengenai UMA Familia di server ini.", emoji="🐎"),
+            discord.SelectOption(label="Server Map", description="Informasi mengenai category dan channel di server ini.", emoji="🗺️"),
+            discord.SelectOption(label="Useful Links", description="Informasi tentang link serbaguna di server ini.", emoji="🔗"),
+        ]
+        super().__init__(placeholder="Pengen tau apa nih di server kita?", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        pilihan = self.values[0]
+        
+        # Mapping nama opsi di Dropdown ke nama Backup di Discohook JSON
+        backup_map = {
+            "Role Utama": "Role Utama",
+            "Leveling Role": "Leveling roles",
+            "UMA Familia": "UMA FAMILIA",
+            "Server Map": "Server map",
+            "Useful Links": "Useful links"
+        }
+        
+        target_backup = backup_map.get(pilihan)
+        
+        # Ambil data dinamis dari file JSON
+        embeds, components_data = get_discohook_backup(target_backup)
+        
+        if embeds:
+            # Jika ada data tombol (seperti di Useful Links), buat View-nya
+            view = DiscohookView(components_data) if components_data else None
+            
+            # Kirim Embed (dan tombol jika ada) secara ephemeral
+            if view and len(view.children) > 0:
+                await interaction.response.send_message(embeds=embeds, view=view, ephemeral=True)
+            else:
+                await interaction.response.send_message(embeds=embeds, ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ Gagal memuat data dari file Discohook.", ephemeral=True)
+
+class PanduanView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(PanduanDropdown())
+
+
+# ==========================================
 # --- BALASAN KATA KUNCI (TANPA PREFIX) ---
 # ==========================================
-
 @client.event
 async def on_message(message):
-    # Mencegah bot membalas pesannya sendiri atau pesan dari bot lain / DM
     if message.author.bot or not message.guild:
         return
 
-    # --- TAMBAHAN: CEK RESTRICT CHANNEL PER SERVER UNTUK KATA KUNCI ---
     if not is_channel_allowed(message.guild, message.channel):
         return
 
-    # Ubah isi pesan menjadi huruf kecil semua agar mudah dideteksi
     pesan = message.content.lower()
-
-    # --- DAFTAR KATA KUNCI VARIASI ---
     kata_sapaan = ['halo wisadel', 'halo']
     kata_pujian = ['kamu hebat sekali wisadel', 'hebat sekali', 'kamu hebat']
     kata_pintar = ['sepertinya kamu sangat pintar ya wisadel', 'pintar juga kamu', 'kamu pintar sekali']
     kata_kangen = ['hai wisadel, aku baru saja ingin mencarimu', 'kamu kemana aja', 'ketemu juga kamu']
 
-    # 1. Jika pesan mengandung salah satu kata sapaan
+    # --- 1. CEK KATA KUNCI HARDCODE (STIKER) ---
     if any(kata in pesan for kata in kata_sapaan):
         try:
-            sticker_balasan = await client.fetch_sticker(STICKER_ID)
+            sticker_balasan = await client.fetch_sticker(1562303852437569536)
             await message.reply('yo dokutah, adakah yang bisa ku bantu?', stickers=[sticker_balasan])
         except discord.NotFound:
-            await message.reply('yo dokutah, adakah yang bisa ku bantu? (Gagal memuat stiker)')
-
-    # 1.1 Pujian untuk Wisadel
+            pass
     elif any(kata in pesan for kata in kata_pujian):
         try:
-            sticker_balasan = await client.fetch_sticker(STICKER_ID)
+            sticker_balasan = await client.fetch_sticker(1562304055647150201)
             await message.reply('oiya dong jelas!', stickers=[sticker_balasan])
         except discord.NotFound:
-            await message.reply('oiya dong jelas!')
-
-    # 1.2 Membuat Wisadel marah jika dipuji
+            pass
     elif any(kata in pesan for kata in kata_pintar):
         try:
-            sticker_balasan = await client.fetch_sticker(STICKER_ID)
+            sticker_balasan = await client.fetch_sticker(1562304321788313630)
             await message.reply('ugh, jangan membuatku marah dokutah!', stickers=[sticker_balasan])
         except discord.NotFound:
-            await message.reply('ugh, jangan membuatku marah dokutah!')
-
-    # 1.3 Kangen wisadel
+            pass
     elif any(kata in pesan for kata in kata_kangen):
         try:
-            sticker_balasan = await client.fetch_sticker(STICKER_ID)
+            sticker_balasan = await client.fetch_sticker(1562303915045945395)
             await message.reply('oho, apa kamu merindukanku?', stickers=[sticker_balasan])
         except discord.NotFound:
-            await message.reply('oho, apa kamu merindukanku?')
+            pass
 
-    # Proses command berprefix "w" (wping, wsapa, dll.)
+    # --- 2. [BARU] INTEGRASI N8N AI (Saat bot di-mention) ---
+    elif client.user in message.mentions:
+        # Hapus format mention <@id> dari teks agar AI hanya membaca isi pesannya
+        pertanyaan = message.content.replace(f'<@{client.user.id}>', '').strip()
+        
+        if pertanyaan:
+            async with message.channel.typing(): # Munculkan efek "Wisadel is typing..."
+                payload = {
+                    "sessionId": str(message.author.id), # Memberikan memori spesifik per-user
+                    "chatInput": pertanyaan
+                }
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(N8N_WEBHOOK_URL, json=payload) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                # Mengambil data output dari AI Agent n8n
+                                jawaban = data.get("output", "Maaf, format balasan n8n tidak sesuai ekspektasi.")
+                                await message.reply(jawaban)
+                            else:
+                                await message.reply(f"Hmph! Koneksiku ke otak utama lagi error nih. (Status HTTP: {resp.status})")
+                except Exception as e:
+                    await message.reply("Ugh, sistem n8n ku sedang bermasalah atau mati!")
+            return # Hentikan eksekusi agar pesan mention tidak memicu pesan 'command not found'
+
     await client.process_commands(message)
-
 
 @client.event
 async def on_reaction_add(reaction, user):
@@ -161,7 +257,6 @@ async def on_reaction_add(reaction, user):
 # ==========================================
 # --- DAFTAR MESSAGE COMMANDS (PREFIX "w") ---
 # ==========================================
-
 async def balas_stiker(ctx, teks, sticker_id):
     try:
         sticker = await client.fetch_sticker(sticker_id)
@@ -171,19 +266,19 @@ async def balas_stiker(ctx, teks, sticker_id):
 
 @client.command(name="sapa")
 async def wsapa(ctx):
-    await balas_stiker(ctx, 'yo dokutah, adakah yang bisa ku bantu?', STICKER_ID)
+    await balas_stiker(ctx, 'yo dokutah, adakah yang bisa ku bantu?', 1562303852437569536)
 
 @client.command(name="pujian")
 async def wpujian(ctx):
-    await balas_stiker(ctx, 'oiya dong jelas!', STICKER_ID)
+    await balas_stiker(ctx, 'oiya dong jelas!', 1562304055647150201)
 
 @client.command(name="pintar")
 async def wpintar(ctx):
-    await balas_stiker(ctx, 'ugh, jangan membuatku marah dokutah!', STICKER_ID)
+    await balas_stiker(ctx, 'ugh, jangan membuatku marah dokutah!', 1562304321788313630)
 
 @client.command(name="kangen")
 async def wkangen(ctx):
-    await balas_stiker(ctx, 'oho, apa kamu merindukanku?', STICKER_ID)
+    await balas_stiker(ctx, 'oho, apa kamu merindukanku?', 1562303915045945395)
 
 @client.command(name="ping")
 async def wping(ctx):
@@ -192,32 +287,28 @@ async def wping(ctx):
 
 @client.command(name="bye")
 async def wbye(ctx):
-    await balas_stiker(ctx, 'ugh, ayolah main sedikit lebih lama', STICKER_ID)
+    await balas_stiker(ctx, 'ugh, ayolah main sedikit lebih lama', 1562304121996841001)
 
 @client.command(name="help")
 async def whelp(ctx):
-    teks_bantuan = (
-        "**Command Prefix `w`:**\n"
-        "- `wsapa`, `wpujian`, `wpintar`, `wkangen`\n"
-        "- `wping`: Tes respon Wisadel\n"
-        "- `wbye`: Mengucapkan selamat tinggal\n"
-        "- `whelp`: Menampilkan pesan ini\n\n"
-        "**Percakapan Biasa (tanpa prefix):**\n"
-        "- Sapa Wisadel dengan: `halo` atau `halo wisadel`\n"
-        "- Puji Wisadel dengan: `kamu hebat`, `hebat sekali`, dll.\n"
-        "- Buat Wisadel marah dengan: `pintar juga kamu`, `kamu pintar sekali`, dll.\n"
-        "- Respon kangen dari Wisadel dengan: `kamu kemana aja`, `ketemu juga kamu`, dll.\n\n"
-        "**Slash Commands:**\n"
-        "- `/halo`: Wisadel akan menyapa Anda\n"
-        "- `/printer`: Wisadel menirukan kata-kata Anda\n"
-        "- `/restrictchannel <channel_ID>`: Command `w` & kata kunci hanya aktif di channel ini (khusus server ini)\n"
-        "- `/unrestrictchannel <channel_ID>`: Hapus channel dari daftar server ini\n"
-        "- `/restrictlist`: Lihat daftar channel yang diizinkan di server ini"
+    embed = discord.Embed(
+        title="📖 Panduan Perintah Wisadel",
+        description="Halo Dokutah! Berikut adalah daftar perintah dan fitur interaktif yang tersedia untukku:",
+        color=discord.Color.red()
     )
-    await ctx.reply(teks_bantuan)
+    embed.add_field(
+        name="💬 Command Prefix `w`",
+        value="- `wsapa`, `wpujian`, `wpintar`, `wkangen`\n- `wping`, `wbye`",
+        inline=False
+    )
+    embed.add_field(
+        name="⚡ Slash Commands",
+        value="- `/halo` , `/printer`\n- `/kirim-panduan` : Kirim menu panduan server\n- `/restrictchannel`, `/unrestrictchannel`, `/restrictlist`",
+        inline=False
+    )
+    await ctx.reply(embed=embed)
 
 async def cari_channel(guild, cid):
-    """Cari channel biasa ATAU thread (termasuk thread yang diarsipkan)."""
     ch = guild.get_channel_or_thread(cid)
     if ch is None:
         try:
@@ -229,7 +320,6 @@ async def cari_channel(guild, cid):
 # ==========================================
 # --- DAFTAR SLASH COMMANDS ---
 # ==========================================
-
 @client.tree.command(name="halo", description="Bot akan menyapa Anda")
 async def say_hello(interaction: discord.Interaction):
     await interaction.response.send_message(f"halo juga dokutah {interaction.user.mention}!")
@@ -238,9 +328,20 @@ async def say_hello(interaction: discord.Interaction):
 async def printer(interaction: discord.Interaction, teks_masukan: str):
     await interaction.response.send_message(teks_masukan)
 
+@client.tree.command(name="kirim-panduan", description="Kirim pesan panduan server interaktif")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+async def kirim_panduan(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="Welcome to ┋ 🪩 ⁞ panduan-server!",
+        description="Silakan gunakan menu *dropdown* di bawah untuk memilih informasi panduan server yang ingin kamu ketahui!",
+        color=discord.Color.blurple()
+    )
+    await interaction.channel.send(embed=embed, view=PanduanView())
+    await interaction.response.send_message("✅ Pesan panduan berhasil dikirim!", ephemeral=True)
+
 @client.tree.command(name="restrictchannel", description="Aktifkan command w & kata kunci di channel ini (khusus server ini)")
 @app_commands.guild_only()
-@app_commands.describe(channel_id="ID channel yang diizinkan")
 @app_commands.default_permissions(manage_guild=True)
 async def restrictchannel(interaction: discord.Interaction, channel_id: str):
     try:
@@ -248,10 +349,9 @@ async def restrictchannel(interaction: discord.Interaction, channel_id: str):
     except ValueError:
         await interaction.response.send_message("❌ ID channel harus berupa angka.", ephemeral=True)
         return
-
     channel = await cari_channel(interaction.guild, cid)
     if channel is None:
-        await interaction.response.send_message("❌ Channel/thread dengan ID itu tidak ditemukan di server ini.", ephemeral=True)
+        await interaction.response.send_message("❌ Channel tidak ditemukan.", ephemeral=True)
         return
 
     g_id = interaction.guild.id
@@ -259,19 +359,15 @@ async def restrictchannel(interaction: discord.Interaction, channel_id: str):
         ALLOWED_CHANNELS_PER_GUILD[g_id] = set()
 
     if cid in ALLOWED_CHANNELS_PER_GUILD[g_id]:
-        await interaction.response.send_message(f"⚠️ {channel.mention} sudah ada di daftar channel yang diizinkan di server ini.", ephemeral=True)
+        await interaction.response.send_message("⚠️ Sudah diizinkan.", ephemeral=True)
         return
 
     ALLOWED_CHANNELS_PER_GUILD[g_id].add(cid)
     save_allowed()
-    daftar = ", ".join(f"<#{c}>" for c in ALLOWED_CHANNELS_PER_GUILD[g_id])
-    await interaction.response.send_message(
-        f"🔒 Command `w` & kata kunci di server ini sekarang **hanya** aktif di: {daftar}"
-    )
+    await interaction.response.send_message(f"🔒 Diaktifkan di <#{cid}>")
 
 @client.tree.command(name="unrestrictchannel", description="Hapus channel dari daftar yang diizinkan di server ini")
 @app_commands.guild_only()
-@app_commands.describe(channel_id="ID channel yang dihapus dari daftar")
 @app_commands.default_permissions(manage_guild=True)
 async def unrestrictchannel(interaction: discord.Interaction, channel_id: str):
     try:
@@ -282,43 +378,26 @@ async def unrestrictchannel(interaction: discord.Interaction, channel_id: str):
 
     g_id = interaction.guild.id
     guild_set = ALLOWED_CHANNELS_PER_GUILD.get(g_id, set())
-
     if cid not in guild_set:
-        await interaction.response.send_message("⚠️ Channel itu tidak ada di daftar channel yang diizinkan di server ini.", ephemeral=True)
+        await interaction.response.send_message("⚠️ Tidak ada dalam daftar.", ephemeral=True)
         return
 
     guild_set.discard(cid)
-    # Jika set kosong, hapus key guild dari dictionary agar bersih
     if not guild_set:
         ALLOWED_CHANNELS_PER_GUILD.pop(g_id, None)
     save_allowed()
-
-    channel = await cari_channel(interaction.guild, cid)
-    nama = channel.mention if channel else f"`{cid}`"
-
-    updated_set = ALLOWED_CHANNELS_PER_GUILD.get(g_id, set())
-    if updated_set:
-        daftar = ", ".join(f"<#{c}>" for c in updated_set)
-        await interaction.response.send_message(
-            f"🔓 {nama} dihapus dari daftar. Command `w` & kata kunci di server ini sekarang aktif di: {daftar}"
-        )
-    else:
-        await interaction.response.send_message(
-            f"🔓 {nama} dihapus dari daftar. Tidak ada channel yang direstrict lagi untuk server ini, kembali aktif di **semua channel**."
-        )
+    await interaction.response.send_message(f"🔓 <#{cid}> dihapus dari daftar.")
 
 @client.tree.command(name="restrictlist", description="Lihat daftar channel yang diizinkan di server ini")
 @app_commands.guild_only()
 async def restrictlist(interaction: discord.Interaction):
     g_id = interaction.guild.id
     guild_set = ALLOWED_CHANNELS_PER_GUILD.get(g_id, set())
-    
     if not guild_set:
-        await interaction.response.send_message("📋 Tidak ada restrict untuk server ini. Aktif di semua channel.", ephemeral=True)
+        await interaction.response.send_message("📋 Aktif di semua channel.", ephemeral=True)
     else:
         daftar = "\n".join(f"- <#{c}>" for c in guild_set)
-        await interaction.response.send_message(f"📋 Command `w` & kata kunci di server ini hanya aktif di:\n{daftar}", ephemeral=True)
-
+        await interaction.response.send_message(f"📋 Aktif di:\n{daftar}", ephemeral=True)
 
 # Inisialisasi dan jalankan bot menggunakan Token Anda
 client.run('YOUR_BOT_TOKEN')
