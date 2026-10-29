@@ -1,3 +1,5 @@
+import os
+from dotenv import load_dotenv
 import json
 import discord
 import aiohttp # [BARU] Import aiohttp untuk HTTP request
@@ -10,6 +12,7 @@ N8N_WEBHOOK_URL = "https://ptilopsis.app.n8n.cloud/webhook/11a19b0a-b7a7-4b59-80
 # 1. Mengatur intents (hak akses) default untuk bot
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 
 # 2. Inisialisasi bot
 client = commands.Bot(
@@ -182,11 +185,15 @@ class PanduanView(discord.ui.View):
 # ==========================================
 @client.event
 async def on_message(message):
-    if message.author.bot or not message.guild:
+    # 1. Abaikan pesan dari bot lain (termasuk dirinya sendiri)
+    if message.author.bot:
         return
 
-    if not is_channel_allowed(message.guild, message.channel):
-        return
+    # 2. Jika pesan berasal dari Server (Guild), terapkan filter Restrict Channel
+    # Jika pesan dari DM (message.guild adalah None), filter ini otomatis dilewati
+    if message.guild:
+        if not is_channel_allowed(message.guild, message.channel):
+            return
 
     pesan = message.content.lower()
     kata_sapaan = ['halo wisadel', 'halo']
@@ -220,15 +227,30 @@ async def on_message(message):
         except discord.NotFound:
             pass
 
-    # --- 2. [BARU] INTEGRASI N8N AI (Saat bot di-mention) ---
-    elif client.user in message.mentions:
-        # Hapus format mention <@id> dari teks agar AI hanya membaca isi pesannya
-        pertanyaan = message.content.replace(f'<@{client.user.id}>', '').strip()
+    # --- 2. INTEGRASI N8N AI (Aktif saat di-mention ATAU lewat jalur DM) ---
+    elif not message.guild or client.user in message.mentions:
+        # Menerjemahkan semua mention di dalam pesan
+        pertanyaan = message.content
+        for user_mentioned in message.mentions:
+            if user_mentioned.id == client.user.id:
+                # Hapus mention ke Wisadel agar tidak masuk ke prompt AI
+                pertanyaan = pertanyaan.replace(f'<@{client.user.id}>', '')
+            else:
+                # Ubah mention ID user lain menjadi nama tampilan (display name) mereka
+                pertanyaan = pertanyaan.replace(f'<@{user_mentioned.id}>', user_mentioned.display_name)
+        
+        pertanyaan = pertanyaan.strip()
         
         if pertanyaan:
-            async with message.channel.typing(): # Munculkan efek "Wisadel is typing..."
+            async with message.channel.typing():
+                # Memisahkan ID memori berdasarkan lokasi obrolan
+                if message.guild:
+                    id_memori = f"{message.author.id}-server-{message.guild.id}"
+                else:
+                    id_memori = f"{message.author.id}-dm"
+
                 payload = {
-                    "sessionId": str(message.author.id), # Memberikan memori spesifik per-user
+                    "sessionId": id_memori, 
                     "chatInput": pertanyaan
                 }
                 try:
@@ -236,23 +258,15 @@ async def on_message(message):
                         async with session.post(N8N_WEBHOOK_URL, json=payload) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
-                                # Mengambil data output dari AI Agent n8n
                                 jawaban = data.get("output", "Maaf, format balasan n8n tidak sesuai ekspektasi.")
                                 await message.reply(jawaban)
                             else:
                                 await message.reply(f"Hmph! Koneksiku ke otak utama lagi error nih. (Status HTTP: {resp.status})")
                 except Exception as e:
                     await message.reply("Ugh, sistem n8n ku sedang bermasalah atau mati!")
-            return # Hentikan eksekusi agar pesan mention tidak memicu pesan 'command not found'
+        return 
 
     await client.process_commands(message)
-
-@client.event
-async def on_reaction_add(reaction, user):
-    if user.bot or not reaction.message.guild:
-        return
-    await reaction.message.channel.send(f'{user.name} baru saja memberikan reaksi {reaction.emoji}!')
-
 
 # ==========================================
 # --- DAFTAR MESSAGE COMMANDS (PREFIX "w") ---
@@ -298,7 +312,7 @@ async def whelp(ctx):
     )
     embed.add_field(
         name="💬 Command Prefix `w`",
-        value="- `wsapa`, `wpujian`, `wpintar`, `wkangen`\n- `wping`, `wbye`",
+        value="- `wsapa`, `wpujian`, `wpintar`, `wkangen`\n- `wping`, `wbye`\n- `wfarm <id>` : Cek drop rate material Arknights\n- `witemlist` : Lihat daftar ID material",
         inline=False
     )
     embed.add_field(
@@ -399,5 +413,134 @@ async def restrictlist(interaction: discord.Interaction):
         daftar = "\n".join(f"- <#{c}>" for c in guild_set)
         await interaction.response.send_message(f"📋 Aktif di:\n{daftar}", ephemeral=True)
 
-# Inisialisasi dan jalankan bot menggunakan Token Anda
-client.run('YOUR_BOT_TOKEN')
+@client.tree.command(name="inforole", description="Melihat daftar member yang memiliki role tertentu")
+@app_commands.describe(role="Pilih role yang ingin dicek")
+async def inforole(interaction: discord.Interaction, role: discord.Role):
+    # Mengambil daftar member dari role tersebut
+    anggota = role.members
+    
+    if not anggota:
+        await interaction.response.send_message(f"Cih, role {role.mention} kosong! Nggak ada membernya sama sekali.", ephemeral=True)
+        return
+
+    # Menggabungkan nama-nama member (maksimal 2000 karakter untuk Discord)
+    daftar_nama = [f"- {member.mention} ({member.display_name})" for member in anggota]
+    deskripsi = "\n".join(daftar_nama)
+    
+    # Memotong teks jika terlalu panjang (Discord membatasi deskripsi embed max 4096 karakter)
+    if len(deskripsi) > 4000:
+        deskripsi = deskripsi[:3990] + "\n...dan masih banyak lagi."
+
+    embed = discord.Embed(
+        title=f"📋 Daftar Member Role: {role.name} ({len(anggota)} orang)",
+        description=deskripsi,
+        color=role.color
+    )
+    embed.set_footer(text="Nih datanya. Jangan bilang aku nggak pernah bantuin kamu, Dokutah.")
+    
+    await interaction.response.send_message(embed=embed)
+
+# ==========================================
+# --- FITUR FARMING ARKNIGHTS (PENGUIN STATS) ---
+# ==========================================
+async def fetch_penguin_matrix(item_id: str, server: str = "US"):
+    url = "https://penguin-stats.io/PenguinStats/api/v2/result/matrix"
+    params = {"server": server, "itemFilter": item_id}
+    
+    # aiohttp sudah di-import di bagian atas file
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params=params) as response:
+            if response.status == 200:
+                data = await response.json()
+                return data.get("matrix", [])
+            return None
+
+@client.command(name="farm")
+async def wfarm(ctx, item_id: str):
+    async with ctx.typing():
+        matrix_data = await fetch_penguin_matrix(item_id)
+        
+        if not matrix_data:
+            await ctx.reply("Hah? Servernya sedang bermasalah atau item ID itu tidak valid!")
+            return
+
+        # Sortir stage berdasarkan probabilitas drop tertinggi (minimal 500 run)
+        sorted_stages = sorted(
+            [d for d in matrix_data if d.get("times", 0) > 500],
+            key=lambda x: x.get("quantity", 0) / x.get("times", 1), 
+            reverse=True
+        )
+        
+        if not sorted_stages:
+            await ctx.reply("Tidak ada data drop rate yang cukup untuk material itu. Cari sendiri sana!")
+            return
+
+        best_stage = sorted_stages[0]
+        drop_rate = (best_stage["quantity"] / best_stage["times"]) * 100
+
+        embed = discord.Embed(
+            title="📊 Laporan Farming Material", 
+            description="Hmph, ini data drop ratenya. Jangan harap aku mau repot-repot mencarinya lagi untukmu, Dokutah!",
+            color=0xFF5733
+        )
+        embed.add_field(name="Stage Terbaik", value=best_stage["stageId"], inline=True)
+        embed.add_field(name="Drop Rate", value=f"{drop_rate:.1f}%", inline=True)
+        embed.add_field(name="Total Sampel", value=f"{best_stage['times']} run", inline=True)
+        embed.set_footer(text="Data bersumber dari Penguin Statistics")
+
+        await ctx.reply(embed=embed)
+
+@client.command(name="itemlist")
+async def witemlist(ctx):
+    embed = discord.Embed(
+        title="📦 Daftar ID Material Arknights",
+        description="Ugh, kalian ini merepotkan sekali! Ini daftar ID material yang paling sering di-farming. Jangan suruh aku mengulangnya lagi, Dokutah!",
+        color=discord.Color.dark_purple()
+    )
+    
+    # Kategori 1: Material Dasar
+    dasar = (
+        "🪨 **Orirock Cube:** `30012`\n"
+        "🍬 **Sugar Pack:** `30022`\n"
+        "🧵 **Polyester Pack:** `30032`\n"
+        "🔩 **Oriron Cluster:** `30042`\n"
+        "🧪 **Aketon Halif:** `30052`"
+    )
+    embed.add_field(name="Material Dasar (T3)", value=dasar, inline=False)
+    
+    # Kategori 2: Material Lanjutan
+    lanjutan = (
+        "🍺 **Loxic Kohl:** `30062`\n"
+        "🪚 **Grindstone:** `30073`\n"
+        "🧲 **Manganese Ore:** `30083`\n"
+        "🦔 **RMA70-12:** `30103`\n"
+        "💎 **Incandescent Alloy:** `30113`\n"
+        "🍮 **Coagulating Gel:** `30123`"
+    )
+    embed.add_field(name="Material Lanjutan (T3)", value=lanjutan, inline=False)
+    
+    # Kategori 3: Material Baru (Chapter 9+)
+    baru = (
+        "💧 **Compound Cutting Fluid:** `30133`\n"
+        "🧂 **Salt:** `30143`\n"
+        "🪵 **Cyclic Hydrocarbon:** `30153`"
+    )
+    embed.add_field(name="Material Baru (T3)", value=baru, inline=False)
+
+    embed.set_footer(text="Gunakan wfarm <id> untuk mengecek drop rate!")
+    
+    await ctx.reply(embed=embed)
+
+# ==========================================
+# --- INISIALISASI & JALANKAN BOT ---
+# ==========================================
+# Memuat variabel lingkungan dari file .env
+load_dotenv()
+
+# Mengambil token dan menjalankan bot
+TOKEN = os.getenv('DISCORD_TOKEN')
+
+if TOKEN is None:
+    print("Error: DISCORD_TOKEN tidak ditemukan. Pastikan file .env sudah dibuat!")
+else:
+    client.run(TOKEN)
